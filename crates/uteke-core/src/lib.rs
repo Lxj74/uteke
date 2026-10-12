@@ -31,6 +31,7 @@ mod jaccard;
 mod list_request;
 mod maintenance;
 pub mod memory;
+pub mod namespace_deprecation;
 pub mod offline_extraction;
 mod operations;
 pub mod pack_mode;
