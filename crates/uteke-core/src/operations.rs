@@ -15,6 +15,10 @@ use std::time::Duration;
 /// Embedding failures silently drop vector entries, causing the vector
 /// index to desync from SQLite. This helper retries up to 3 times with
 /// 200ms, 400ms, then 800ms delays between attempts.
+///
+/// If the embedder slot is empty (it should not be after `ensure_embedder`),
+/// returns an embedding error instead of panicking. Validation errors are
+/// returned immediately: they can never succeed on retry.
 pub(crate) fn retry_embed(
     embedder: &Mutex<Option<Box<dyn crate::embed::Embedder>>>,
     text: &str,
@@ -26,9 +30,14 @@ pub(crate) fn retry_embed(
         let lock = embedder
             .lock()
             .map_err(|_| Error::lock("embedder lock during remember"))?;
-        let embedder = lock.as_ref().expect("embedder ensured above");
+        let Some(embedder) = lock.as_ref() else {
+            return Err(Error::embed_msg(
+                "No embedder configured; the memory was not embedded",
+            ));
+        };
         match embedder.embed(text) {
             Ok(embedding) => return Ok(embedding),
+            Err(e @ Error::Validation(_)) => return Err(e),
             Err(e) => {
                 drop(lock); // Release lock before sleeping
                 if attempt < MAX_RETRIES - 1 {
@@ -609,7 +618,9 @@ impl crate::Uteke {
             .lock()
             .map_err(|_| Error::lock("embedder lock during recall"))?
             .as_ref()
-            .expect("embedder ensured above")
+            .ok_or_else(|| {
+                Error::embed_msg("No embedder configured; semantic recall is unavailable")
+            })?
             .embed(query)?;
         // Embedder lock dropped here — other threads can embed or recall concurrently.
 
@@ -1178,19 +1189,28 @@ impl crate::Uteke {
         let mut results: Vec<SearchResult> = scored
             .into_iter()
             .take(limit)
-            .map(|(id, score)| {
-                let memory = memories
-                    .remove(&id)
-                    .expect("RRF score references memory that should exist");
+            .filter_map(|(id, score)| {
+                // Every RRF id is inserted into `memories` in the same loop,
+                // so this cannot miss today. If that invariant ever breaks,
+                // skip the id with a warning instead of panicking (the result
+                // may then hold fewer than `limit` items; `take` stays first so
+                // the normal path is unchanged).
+                let Some(memory) = memories.remove(&id) else {
+                    tracing::warn!(
+                        id = %id,
+                        "RRF score references a memory missing from the fused set; skipping"
+                    );
+                    return None;
+                };
                 // RRF score is sum of 1/(k+rank) from both channels.
                 // Max possible: 2/(k+1) when rank=0 in both.
                 // Normalize by dividing by that theoretical max.
                 let max_rrf = 2.0 / (RRF_K as f64 + 1.0);
                 let normalized = (score / max_rrf).clamp(0.0, 1.0);
-                SearchResult {
+                Some(SearchResult {
                     memory,
                     score: normalized as f32,
-                }
+                })
             })
             .collect();
 
@@ -3066,7 +3086,7 @@ mod remember_embedding_status_tests {
     impl Embedder for FailingEmbedder {
         fn embed(&self, _text: &str) -> Result<Vec<f32>, Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(Error::Validation("simulated provider outage".to_string()))
+            Err(Error::embed_msg("simulated provider outage"))
         }
         fn dims(&self) -> usize {
             4
@@ -3090,7 +3110,7 @@ mod remember_embedding_status_tests {
         fn embed(&self, _text: &str) -> Result<Vec<f32>, Error> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
-                Err(Error::Validation(format!("transient failure #{n}")))
+                Err(Error::embed_msg(format!("transient failure #{n}")))
             } else {
                 Ok(vec![0.1f32; 4])
             }
@@ -3311,5 +3331,115 @@ mod recall_touch_tests {
             )
             .unwrap();
         assert_eq!(counts(&u, &ids), [0, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod retry_embed_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Fake embedder that counts calls and fails the first `failures` calls
+    /// with the error built by `make_err`, then succeeds.
+    struct ScriptedEmbedder {
+        calls: Arc<AtomicUsize>,
+        failures: usize,
+        make_err: fn() -> Error,
+    }
+
+    impl crate::embed::Embedder for ScriptedEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, Error> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures {
+                Err((self.make_err)())
+            } else {
+                Ok(vec![0.0; 4])
+            }
+        }
+        fn dims(&self) -> usize {
+            4
+        }
+        fn max_seq_len(&self) -> usize {
+            8
+        }
+        fn name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn scripted(
+        failures: usize,
+        make_err: fn() -> Error,
+    ) -> (
+        Mutex<Option<Box<dyn crate::embed::Embedder>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Box<dyn crate::embed::Embedder> = Box::new(ScriptedEmbedder {
+            calls: Arc::clone(&calls),
+            failures,
+            make_err,
+        });
+        (Mutex::new(Some(embedder)), calls)
+    }
+
+    #[test]
+    fn validation_error_is_not_retried() {
+        let (embedder, calls) = scripted(usize::MAX, || Error::Validation("bad input".into()));
+        let err = retry_embed(&embedder, "hello").unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transient_error_is_retried_then_succeeds() {
+        let (embedder, calls) = scripted(1, || Error::embed_msg("timeout"));
+        let embedding = retry_embed(&embedder, "hello").unwrap();
+        assert_eq!(embedding.len(), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn no_embedder_is_an_error_not_a_panic() {
+        let embedder: Mutex<Option<Box<dyn crate::embed::Embedder>>> = Mutex::new(None);
+        let err = retry_embed(&embedder, "hello").unwrap_err();
+        assert!(matches!(err, Error::Embedding { .. }), "{err:?}");
+        assert!(err.to_string().contains("No embedder"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod recall_no_embedder_tests {
+    #[cfg(feature = "onnx")]
+    use crate::Uteke;
+
+    /// A store whose embedder slot is empty and cannot be filled: the
+    /// "custom" backend with no injected embedder. `ensure_embedder` fails,
+    /// so vector recall must return an error, never panic. Gated on `onnx`
+    /// because non-onnx builds reject "custom" at open().
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn recall_without_embedder_returns_error() {
+        let (_db_str, store) = Uteke::open_store(":memory:").expect("open_store");
+        let u = Uteke::finish_open_full(
+            store,
+            None,
+            "custom".to_string(),
+            crate::TierConfig::default(),
+            crate::RecallConfig::default(),
+            crate::EmbeddingSettings::default(),
+            crate::graph_rerank::GraphRerankConfig::default(),
+            None,
+        )
+        .expect("finish_open_full");
+
+        let res = u.recall("anything", 5, None, None, 0.0, None, None);
+        let err = res.expect_err("recall without an embedder must be an error");
+        assert!(
+            err.to_string()
+                .contains("Custom embedder backend set but no embedder was provided"),
+            "got: {err}"
+        );
     }
 }
