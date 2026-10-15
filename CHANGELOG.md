@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- **`uteke upgrade` verifies a minisign signature over `checksums-sha256.txt` (#1327)** - the release maintainer signs the checksums offline (`scripts/sign-release.sh`) and uploads `checksums-sha256.txt.minisig`; the embedded public key (`scripts/uteke-release.pub`) and the trusted comment `uteke <tag>` are checked before any hash in the file is trusted, so a tampered file is rejected, one release's files cannot be served as another's (the signature is bound to the tag), and `uteke upgrade` now refuses to downgrade to an older release. It also installs only stable releases (`vX.Y.Z`), never a pre-release or build-metadata tag. The signature is checked by `uteke upgrade` only: `install.sh`, `install.ps1` and Homebrew do not verify it (verify manually per SECURITY.md). A missing or invalid signature is a hard failure; `UTEKE_UPGRADE_SKIP_CHECKSUM=1` skips it too. Manual steps are in SECURITY.md.
+
 ### Fixed
 
 - **`ORT_LIB_PATH` pointing at a directory no longer leaves uteke without embeddings (#1459)** - the Homebrew shims exported the `libexec` directory (v0.19.0 onwards), `dlopen` failed on it, and every such install silently stored memories FTS5-only (`embedding_written: false`, `uteke verify` MISMATCH). A directory that holds the platform library (`libonnxruntime.so`, `libonnxruntime.dylib` or `onnxruntime.dll`) is now accepted with a warning; a directory without it is a clear error that says to set the library file. The tap fix is codecoradev/homebrew-tap#10 (`brew update && brew reinstall codecoradev/tap/uteke`). Docker and the release tarballs were not affected.
