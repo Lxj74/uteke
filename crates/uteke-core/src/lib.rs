@@ -53,6 +53,8 @@ pub use recall_request::{
 pub use remember_request::{
     RememberInput, RememberPolicy, RememberRequest, RememberRequestError, metadata_from_cli_flags,
 };
+#[cfg(test)]
+mod isolation_tests;
 mod orphans;
 pub mod provenance;
 mod recall_cache;
@@ -63,8 +65,9 @@ mod rooms;
 pub mod rooms_segments;
 pub mod salience_recency;
 pub mod structural_export;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 mod timeline;
 mod types;
 pub mod update_check;
